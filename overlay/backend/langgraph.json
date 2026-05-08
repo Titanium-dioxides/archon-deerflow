@@ -1,0 +1,10 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "python_version": "3.12",
+  "dependencies": ["."],
+  "env": ".env",
+  "graphs": {
+    "lead_agent": "deerflow.agents:make_lead_agent",
+    "archon_workflow": "deerflow.archon_workflow:build_archon_graph"
+  }
+}

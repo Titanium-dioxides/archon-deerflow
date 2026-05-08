@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "archon-lean-lsp": {
+      "enabled": true,
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["/app/overlay/tools/lean-lsp-mcp"],
+      "env": {},
+      "description": "Lean 4 LSP MCP Server"
+    }
+  },
+  "skills": {}
+}
