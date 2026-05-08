@@ -1,22 +1,45 @@
 """
-Unified Math Prover — Rethlas 非形式化证明 + Archon Lean4 形式化
+Unified Math Prover — Rethlas 非形式化证明 → Archon(Lean) 验证
 ================================================================
-组合架构:
+完整保留两端原始 Agent 工作流：
 
-用户输入命题
-    │
-    ▼
-rethlas_generate ──→ rethlas_verify
-    ▲                      │
-    └── wrong (≤2 retries) │
-                           ▼ correct
-                    archon_planner
-                           │
-                           ▼
-                    archon_prover
-                           │
-                           ▼
-                    archon_reviewer ──→ COMPLETE
+  Rethlas: generate → verify(JSON) → repair(≤3)
+  Archon:  planner → prover → reviewer
+
+  用户命题
+      │
+      ▼
+  ┌─ Rethlas Generate ────────┐
+  │  (prompts/generator.md)    │
+  └─────────┬──────────────────┘
+            │ <proof>...
+            ▼
+  ┌─ Rethlas Verify ──────────┐
+  │  (prompts/verifier.md)    │  JSON self-check
+  │  verdict=="wrong" → fix   │  ≤3 rounds
+  └─────────┬──────────────────┘
+            │ correct
+            ▼
+  ┌─ Archon Planner ──────────┐
+  │  扫描 sorry, 排优先级     │
+  └─────────┬──────────────────┘
+            │
+            ▼
+  ┌─ Archon Prover ───────────┐
+  │  以 Rethlas proof 为指引  │
+  │  填充 Lean 代码           │
+  └─────────┬──────────────────┘
+            │
+            ▼
+  ┌─ Archon Reviewer ─────────┐
+  │  lake build 验证          │
+  │                            │
+  ├── PASS → COMPLETE ✅      │
+  │                            │
+  └── FAIL → Rethlas(Lean err)┘
+              ▲ (Rethlas 阅读理解 Lean 错误, 修复证明)
+              │
+              └── 重新生成 ───┘
 """
 
 import json, os, re, subprocess
@@ -29,8 +52,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from deerflow.models import create_chat_model
 
-# ── 搜索端点 ──────────────────────────────────────────────────────────
-SEARCH_URL = "https://leansearch.net/thm/search"
+
+# ── 路径常量 ──────────────────────────────────────────────────────────
+_RETHLAS_DIR = "/home/zdzdhd/deer-flow/skills/custom/math-prover"
+_GEN_PROMPT = f"{_RETHLAS_DIR}/prompts/generator.md"
+_VER_PROMPT = f"{_RETHLAS_DIR}/prompts/verifier.md"
+_SEARCH_URL = "https://leansearch.net/thm/search"
 
 # ── 状态 ──────────────────────────────────────────────────────────────
 
@@ -38,14 +65,16 @@ SEARCH_URL = "https://leansearch.net/thm/search"
 class UnifiedState(dict):
     messages: Annotated[list, add_messages]
 
-    # Rethlas 阶段
-    statement: str              # 用户输入的数学命题
-    informal_proof: str         # 生成的<proof>非形式化证明
-    rethlas_attempts: int       # 生成尝试次数
-    rethlas_history: list       # 修复历史
-    rethlas_failed: bool        # 3 次仍未通过
+    # 命题
+    statement: str                    # 用户输入的数学命题
 
-    # Archon 阶段
+    # Rethlas 阶段 (保留原 Rethlas Agent 工作流)
+    informal_proof: str               # 生成的 <proof>...
+    rethlas_attempts: int             # 生成→验证轮数
+    rethlas_history: list             # 修复历史 [{attempt, verdict, ...}]
+    rethlas_failed: bool              # 3 轮均未通过
+
+    # Archon 阶段 (保留原 Archon Agent 工作流)
     workspace_path: str
     stage: Literal["AUTOFORMALIZE", "PROVER", "POLISH", "COMPLETE"]
     pending: list
@@ -53,6 +82,10 @@ class UnifiedState(dict):
     loop_count: int
     max_loops: int
     review: str
+
+    # 跨层反馈
+    archon_feedback: str              # Lean 编译错误 → 送回 Rethlas
+    archon_outer_cycles: int           # Rethlas→Archon 外层尝试次数
 
 
 def fresh_state(statement: str, ws: str = "", max_loops: int = 5) -> UnifiedState:
@@ -67,10 +100,12 @@ def fresh_state(statement: str, ws: str = "", max_loops: int = 5) -> UnifiedStat
         stage="AUTOFORMALIZE",
         pending=[], completed=[], loop_count=0,
         max_loops=max_loops, review="",
+        archon_feedback="",
+        archon_outer_cycles=0,
     )
 
 
-# ── 工具 ──────────────────────────────────────────────────────────────
+# ── 基础工具 ──────────────────────────────────────────────────────────
 
 
 def _bash(cmd: str, cwd: str) -> subprocess.CompletedProcess:
@@ -85,37 +120,16 @@ def _model(name="deepseek-v4", think=False):
     return create_chat_model(name, thinking_enabled=think)
 
 
-def _search_theorems(query: str) -> list[dict]:
-    """通过 leansearch.net 搜索相关定理"""
-    import urllib.request, ssl
-
-    payload = json.dumps({
-        "query": query,
-        "task": "Given a math statement, retrieve useful references.",
-        "num_results": 5,
-    }).encode()
-    try:
-        ctx = ssl.create_default_context()
-        req = urllib.request.Request(
-            SEARCH_URL, data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"[search] 搜索失败: {e}")
-        return []
+def _read_prompt(path: str) -> str:
+    return Path(path).read_text() if Path(path).exists() else ""
 
 
 def _extract_proof(text: str) -> str:
-    """从 LLM 回复中提取 <proof> 内容"""
     m = re.search(r'<proof>(.*?)</proof>', text, re.DOTALL)
     return m.group(1).strip() if m else text.strip()
 
 
 def _extract_json(text: str) -> dict:
-    """从 LLM 回复中提取 JSON"""
     m = re.search(r'\{.*\}', text, re.DOTALL)
     if m:
         try:
@@ -123,6 +137,11 @@ def _extract_json(text: str) -> dict:
         except json.JSONDecodeError:
             pass
     return {"verdict": "parse_failed"}
+
+
+def _extract_code(text: str) -> str:
+    m = re.search(r'```(?:lean)?\s*\n?(.*?)```', text, re.DOTALL)
+    return m.group(1).strip() if m else text.strip()
 
 
 def _scan(ws: str) -> list[dict]:
@@ -145,7 +164,7 @@ def _sorries(ws: str) -> int:
 
 def _build(ws: str) -> tuple[bool, str]:
     r = _bash("lake build 2>&1", ws)
-    return r.returncode == 0, r.stdout + r.stderr
+    return r.returncode == 0, r.stderr + r.stdout
 
 
 def _read(ws: str, f: str) -> str:
@@ -157,106 +176,104 @@ def _write(ws: str, f: str, content: str) -> None:
     (Path(ws) / f).write_text(content)
 
 
-def _extract(text: str) -> str:
-    m = re.search(r'```(?:lean)?\s*\n?(.*?)```', text, re.DOTALL)
-    return m.group(1).strip() if m else text.strip()
+def _search(query: str) -> list[dict]:
+    import urllib.request, ssl
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            _SEARCH_URL,
+            data=json.dumps({"query": query, "task": "retrieve useful theorems", "num_results": 5}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            return json.loads(resp.read().decode()) if resp else []
+    except Exception:
+        return []
 
 
-# ══════════════════════════════════════════════════════════════════
-# Rethlas 节点
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Rethlas 节点 (保留原始 Agent 工作流: generate → verify JSON → repair)
+# ═══════════════════════════════════════════════════════════════════════
 
 
 def search_node(state: UnifiedState) -> UnifiedState:
-    """Step 0: 搜索相关定理作为上下文注入"""
-    stmt = state["statement"]
-    print(f"[search] 搜索: {stmt[:60]}...")
-
-    results = _search_theorems(stmt)
+    """Step 0: 外部定理检索（可选）"""
+    results = _search(state["statement"])
     if results:
-        context_lines = []
-        for r in results[:3]:
-            title = r.get("title", "")
-            theorem = r.get("theorem", "")
-            if title or theorem:
-                context_lines.append(f"- {title}: {theorem[:200]}")
-        if context_lines:
-            context = "\n".join(context_lines)
-            print(f"[search] 找到 {len(results)} 条结果")
-            # 注入到 state 供后续节点使用
-            state["messages"].append(
-                SystemMessage(content=f"[CONTEXT] 相关定理:\n{context}")
-            )
-        else:
-            print(f"[search] 无结构化结果")
-    else:
-        print(f"[search] 无结果")
+        ctx = "\n".join(
+            f"- {r.get('title','')}: {r.get('theorem','')[:200]}"
+            for r in results[:3] if r.get('theorem')
+        )
+        if ctx:
+            state["messages"].append(SystemMessage(content=f"[CONTEXT] 相关定理:\n{ctx}"))
+            print(f"[search] 检索到 {len(results)} 条结果")
     return state
 
 
 def generator_node(state: UnifiedState) -> UnifiedState:
-    """Step 1: 生成非形式化证明"""
+    """Step 1: Rethlas 非形式化证明生成 (原始 generator.md)"""
     state["rethlas_attempts"] += 1
     stmt = state["statement"]
     attempt = state["rethlas_attempts"]
 
-    # 加载 generator 提示词
-    gen_prompt_path = Path("/home/zdzdhd/deer-flow/skills/custom/math-prover/prompts/generator.md")
-    gen_prompt = gen_prompt_path.read_text() if gen_prompt_path.exists() else ""
+    gen_prompt = _read_prompt(_GEN_PROMPT)
+    sys_msg = gen_prompt
 
-    # 构建消息
-    messages = [SystemMessage(content=gen_prompt)]
+    # 如果有 Archon 反馈的 Lean 错误 → Rethlas 阅读理解
+    if state.get("archon_feedback"):
+        sys_msg += (
+            f"\n\n之前的形式化验证失败，Lean 编译错误如下:\n"
+            f"{state['archon_feedback'][-3000:]}"
+            f"\n\n请阅读这些错误，理解为什么你的非形式化证明在形式化时出了问题，"
+            f"然后修复证明。"
+        )
+        print(f"[rethlas] 正在阅读理解 Lean 错误并修复证明 (outer#{state['archon_outer_cycles']})")
 
-    # 如果有修复历史，添加上下文
+    # 如果有修复历史
     if state.get("rethlas_history"):
         last = state["rethlas_history"][-1]
-        messages.append(SystemMessage(content=(
-            f"之前生成的证明被驳回。审核反馈:\n"
-            f"{json.dumps(last, indent=2, ensure_ascii=False)}\n\n"
-            f"请根据审稿人的反馈修改证明。在重新生成前，复述一遍原始定理和所有假设。"
-        )))
+        sys_msg += (
+            f"\n\n之前的审核反馈:\n{json.dumps(last.get('verdict',{}), indent=2, ensure_ascii=False)}"
+        )
 
-    messages.append(HumanMessage(content=f"请证明: {stmt}"))
-    print(f"[rethlas] generate attempt {attempt}")
-
-    resp = _model().invoke(messages)
+    resp = _model().invoke([
+        SystemMessage(content=sys_msg),
+        HumanMessage(content=f"请证明: {stmt}"),
+    ])
     proof = _extract_proof(str(resp.content))
     state["informal_proof"] = proof
-
-    print(f"[rethlas] proof generated ({len(proof)} chars)")
+    print(f"[rethlas] generate attempt {attempt} ({len(proof)} chars)")
+    if state.get("archon_feedback"):
+        state["archon_feedback"] = ""  # 清除反馈，避免重复
     return state
 
 
 def verifier_node(state: UnifiedState) -> UnifiedState:
-    """Step 2: 验证非形式化证明"""
+    """Step 2: Rethlas 自我验证 (原始 verifier.md, 输出 JSON verdict)"""
     stmt = state["statement"]
     proof = state["informal_proof"]
-
-    ver_path = Path("/home/zdzdhd/deer-flow/skills/custom/math-prover/prompts/verifier.md")
-    ver_prompt = ver_path.read_text() if ver_path.exists() else ""
+    ver_prompt = _read_prompt(_VER_PROMPT)
 
     resp = _model(think=False).invoke([
         SystemMessage(content=ver_prompt),
-        HumanMessage(content=f"Statement: {stmt}\n\nProof:\n{proof}"),
+        HumanMessage(content=f"Statement:\n{stmt}\n\nProof:\n{proof}"),
     ])
-
     verdict = _extract_json(str(resp.content))
-    print(f"[rethlas] verify: {verdict.get('verdict', '?')}")
-
-    # 记录历史
     state["rethlas_history"].append({
         "attempt": state["rethlas_attempts"],
         "verdict": verdict,
     })
 
-    if verdict.get("verdict") != "correct":
-        if state["rethlas_attempts"] >= 3:
-            state["rethlas_failed"] = True
-            print(f"[rethlas] ❌ 3 次尝试均失败")
-        else:
-            print(f"[rethlas] 🔄 修复重试 ({state['rethlas_attempts']}/3)")
+    v = verdict.get("verdict", "?")
+    print(f"[rethlas] verify: {v}")
+
+    if v == "correct":
+        print(f"[rethlas] ✅ 非形式化证明通过自我验证")
+    elif state["rethlas_attempts"] >= 3:
+        state["rethlas_failed"] = True
+        print(f"[rethlas] ❌ 3 轮自我验证均未通过")
     else:
-        print(f"[rethlas] ✅ 证明通过验证")
+        print(f"[rethlas] 🔄 修复 (attempt {state['rethlas_attempts']}/3)")
 
     return state
 
@@ -265,9 +282,8 @@ def route_rethlas(state: UnifiedState) -> str:
     """Rethlas 循环路由"""
     if state.get("rethlas_failed"):
         return "rethlas_report"
-    if state.get("rethlas_attempts", 0) >= 3:
+    if state["rethlas_attempts"] >= 3:
         return "rethlas_report"
-    # 检查最后一次验证结果
     history = state.get("rethlas_history", [])
     if history and history[-1].get("verdict", {}).get("verdict") == "correct":
         return "planner"
@@ -275,51 +291,39 @@ def route_rethlas(state: UnifiedState) -> str:
 
 
 def failure_report_node(state: UnifiedState) -> UnifiedState:
-    """Step 3: 输出失败报告"""
+    """Rethlas 自我验证失败报告"""
     stmt = state["statement"]
-    history = state.get("rethlas_history", [])
-    last = history[-1] if history else {}
-    last_verdict = last.get("verdict", {})
-    last_proof = state.get("informal_proof", "")
-
+    hist = state.get("rethlas_history", [])
+    last_v = hist[-1]["verdict"] if hist else {}
     report = (
-        f"## 证明失败报告\n\n"
+        f"## 非形式化证明失败报告\n\n"
         f"**命题：** {stmt}\n\n"
-        f"**尝试次数：** {len(history)}\n\n"
-        f"**最后一次草稿：**\n```\n{last_proof[:1000]}\n```\n\n"
+        f"**尝试次数：** {len(hist)}\n\n"
         f"**最后一次验证反馈：**\n"
-        f"```json\n{json.dumps(last_verdict, indent=2, ensure_ascii=False)}\n```\n\n"
-        f"**失败原因总结：**\n"
+        f"```json\n{json.dumps(last_v, indent=2, ensure_ascii=False)}\n```"
     )
-    errors = last_verdict.get("verification_report", {}).get("critical_errors", [])
-    gaps = last_verdict.get("verification_report", {}).get("gaps", [])
-    for e in errors:
-        report += f"- critical: {e.get('issue', '?')}\n"
-    for g in gaps:
-        report += f"- gap: {g.get('issue', '?')}\n"
-
     state["review"] = report
     state["stage"] = "COMPLETE"
     print(f"[rethlas] 失败报告已生成")
     return state
 
 
-# ══════════════════════════════════════════════════════════════════
-# Archon 节点（复用简化版）
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Archon 节点 (保留原始 Agent 工作流: planner → prover → reviewer)
+# ═══════════════════════════════════════════════════════════════════════
 
 
 def planner_node(state: UnifiedState) -> UnifiedState:
+    """planner: 扫描项目中的 sorry"""
     ws = state["workspace_path"]
-    state["loop_count"] += 1
-
     if not ws or not Path(ws).exists():
-        print("[archon] 未提供工作区路径，跳过形式化")
+        print("[archon] 未提供 Lean 项目路径")
         state["stage"] = "COMPLETE"
         return state
 
+    state["loop_count"] += 1
     sorries = _scan(ws)
-    print(f"[archon] plan: {len(sorries)} sorries")
+    print(f"[archon] planner: {len(sorries)} sorries")
     state["pending"] = sorries
 
     if not sorries:
@@ -330,6 +334,7 @@ def planner_node(state: UnifiedState) -> UnifiedState:
 
 
 def prover_node(state: UnifiedState) -> UnifiedState:
+    """prover: 以 Rethlas 非形式化证明为指引填充 Lean 代码"""
     ws = state["workspace_path"]
     if not ws:
         return state
@@ -348,16 +353,16 @@ def prover_node(state: UnifiedState) -> UnifiedState:
         print(f"[archon] prove: {f}")
         file_content = path.read_text()
 
-        # 注入非形式化证明作为上下文
-        system_msg = "Fill every `sorry` with a correct Lean 4 proof."
-        if informal:
-            system_msg += f"\n\n非形式化证明参考:\n{informal}"
-
+        # 以 Rethlas 非形式化证明为指引
+        proof_ctx = f"\n\n非形式化证明参考:\n{informal}" if informal else ""
         resp = _model().invoke([
-            SystemMessage(content=system_msg),
-            HumanMessage(content=f"File {f}:\n```lean\n{file_content}\n```"),
+            SystemMessage(content=(
+                "你是 Lean4 形式化证明助手。根据给定的非形式化证明指引，"
+                f"将文件中的 `sorry` 替换为正确且完整的 Lean 证明。{proof_ctx}"
+            )),
+            HumanMessage(content=f"文件 {f}:\n```lean\n{file_content}\n```"),
         ])
-        code = _extract(str(resp.content))
+        code = _extract_code(str(resp.content))
         if code and "sorry" not in code:
             _write(ws, f, code)
             ok, _ = _build(ws)
@@ -366,16 +371,16 @@ def prover_node(state: UnifiedState) -> UnifiedState:
                 done.append(f)
                 continue
 
-        # 卡住→推理模型
+        # 卡住 → 推理模型
         hint = _model(think=True).invoke([
             SystemMessage(content="Provide an informal proof sketch."),
             HumanMessage(content=f"Prove in Lean:\n{file_content}"),
         ])
         resp2 = _model().invoke([
-            SystemMessage(content=f"Use hint to fill the sorry.\nHint: {hint.content}"),
+            SystemMessage(content=f"Use the hint to fill the sorry.\nHint: {hint.content}"),
             HumanMessage(content=f"```lean\n{_read(ws, f)}\n```"),
         ])
-        code2 = _extract(str(resp2.content))
+        code2 = _extract_code(str(resp2.content))
         if code2 and "sorry" not in code2:
             _write(ws, f, code2)
             ok, _ = _build(ws)
@@ -388,6 +393,7 @@ def prover_node(state: UnifiedState) -> UnifiedState:
 
 
 def reviewer_node(state: UnifiedState) -> UnifiedState:
+    """reviewer: lake build 验证 + 路由决策"""
     ws = state["workspace_path"]
     if not ws:
         state["stage"] = "COMPLETE"
@@ -401,31 +407,42 @@ def reviewer_node(state: UnifiedState) -> UnifiedState:
 
     if ok and n == 0:
         state["stage"] = "COMPLETE"
+        print(f"[archon] ✅ 全部证明通过 Lean 编译验证")
     elif state["loop_count"] >= state["max_loops"]:
-        state["stage"] = "COMPLETE"
+        # Archon 内部循环耗尽 → 送回 Rethlas
+        state["archon_feedback"] = log[-4000:]
+        state["archon_outer_cycles"] += 1
+        state["archon_feedback"] = log[-4000:]
+        print(f"[archon] ⚠ 形式化失败, 送 Rethlas 阅读理解错误")
+    else:
+        print(f"[archon] 继续 Archon 内部循环")
     return state
 
 
 def route_archon(state: UnifiedState) -> str:
-    return END if state["stage"] == "COMPLETE" else "planner"
+    """Archon 路由: COMPLETE / 内部重试 / 送回 Rethlas"""
+    if state["stage"] == "COMPLETE":
+        return END
+    if state.get("archon_feedback"):
+        return "generator"       # 送回 Rethlas 修复非形式化证明
+    return "planner"             # Archon 内部重试
 
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 # 构建统一图
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 
 
 def build_unified_graph():
-    """构建 Rethlas + Archon 统一工作流"""
     w = StateGraph(UnifiedState)
 
-    # Rethlas 节点
+    # Rethlas 节点 (保留原 Agent 工作流)
     w.add_node("search", search_node)
     w.add_node("generator", generator_node)
     w.add_node("verifier", verifier_node)
     w.add_node("rethlas_report", failure_report_node)
 
-    # Archon 节点
+    # Archon 节点 (保留原 Agent 工作流)
     w.add_node("planner", planner_node)
     w.add_node("prover", prover_node)
     w.add_node("reviewer", reviewer_node)
@@ -433,7 +450,7 @@ def build_unified_graph():
     # 入口
     w.set_entry_point("search")
 
-    # Rethlas 循环边
+    # Rethlas 边: search → generate → verify → (generate|planner|report)
     w.add_edge("search", "generator")
     w.add_edge("generator", "verifier")
     w.add_conditional_edges("verifier", route_rethlas, {
@@ -441,19 +458,23 @@ def build_unified_graph():
         "planner": "planner",
         "rethlas_report": "rethlas_report",
     })
-
-    # Archon 边
     w.add_edge("rethlas_report", END)
+
+    # Archon 边: planner → prover → reviewer
+    # reviewer → generator(Lean FAIL→Rethlas修复) | planner(内部重试) | END
     w.add_edge("planner", "prover")
     w.add_edge("prover", "reviewer")
-    w.add_conditional_edges("reviewer", route_archon)
+    w.add_conditional_edges("reviewer", route_archon, {
+        "generator": "generator",    # Lean 错误 → Rethlas 阅读理解并修复
+        "planner": "planner",        # Archon 内部重试
+        END: END,                     # COMPLETE
+    })
 
     return w.compile()
 
 
 def run_unified_workflow(statement: str, workspace_path: str = "",
                          max_loops: int = 5) -> dict:
-    """运行完整统一工作流"""
     return build_unified_graph().invoke(
         fresh_state(statement, workspace_path, max_loops),
         {"configurable": {"thread_id": "unified-proof"}},
