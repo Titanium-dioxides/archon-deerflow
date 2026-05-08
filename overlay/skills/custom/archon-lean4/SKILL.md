@@ -1,24 +1,29 @@
----
-name: archon-lean4
-display_name: Archon Lean4 Base Skill
-description: Lean4 语言基础能力，包括诊断、搜索、sorry 分析等。
-tags: [archon, lean4, math]
----
+# Archon Lean4 Knowledge
 
-# Archon Lean4 基础技能
+Lean 4 theorem proving best practices.
 
-提供 Lean4 定理证明的基础操作支持。
+## Search Priority
+1. `lean_local_search` — exact symbol/lemma name
+2. `lean_leansearch` — semantic search by mathematical content
+3. `lean_loogle` — simple type-pattern search only
 
-## 可用命令
+## Common Tactics by Goal Shape
+| Goal | Tactic |
+|------|--------|
+| `A → B` | `intro h` |
+| `A ∧ B` | `constructor` / `apply And.intro` |
+| `A ∨ B` | `left` / `right` |
+| `∃ x, P x` | `use x` |
+| `∀ x, P x` | `intro x` |
+| `a = b` | `rfl`, `simp`, `calc` |
+| `¬ A` | `intro h; exfalso; apply h` |
+| `a ≠ b` | `intro h; apply h` → `rfl` after deriving contradiction |
 
-| 命令 | 功能 |
-|------|------|
-| `sorry_analyzer.py` | 分析项目中的 sorry，生成统计报告 |
-| `extract-attempts.py` | 提取证明尝试记录 |
-| `validate-review.py` | 验证审查结果 |
+## Induction Patterns
+- `Nat`: `induction n with | zero => ... | succ n ih => ...`
+- `List`: `induction xs with | nil => ... | cons x xs ih => ...`
+- `inductive` types: `cases` / `induction` + `rename_i` / `case`
 
-## 使用规范
-
-- 修改 .lean 文件后必须运行 `lake build` 确认编译通过
-- 编译失败后需读取完整错误信息再重新尝试
-- 如果连续 3 次相同方向尝试失败，应更换证明策略
+## Compilation Check
+After any proof change, run `lake build` and parse errors fully before retrying.
+If a direction fails 3+ times identically, switch strategy.

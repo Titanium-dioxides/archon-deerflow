@@ -1,16 +1,4 @@
-# Environment
 .env
-
-# DeerFlow checkout (bootstrap.sh creates this)
-/deer-flow/
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Editor
 *.swp
-*.swo
-*~
-.vscode/
-.idea/
+__pycache__/
